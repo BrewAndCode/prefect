@@ -6,6 +6,7 @@ topology (building a Sentinel-backed client is lazy and does not connect).
 """
 
 import pickle
+import warnings
 
 import pytest
 import redis
@@ -16,12 +17,14 @@ from prefect_redis.cleanup_queue import WorkerCleanupQueue
 from prefect_redis.client import (
     RedisMessagingSettings,
     async_redis_from_settings,
+    clear_cached_credential_providers,
     get_async_redis_client,
     is_cluster_url,
 )
 from prefect_redis.connection import aclose_redis_client, is_sentinel_url
 from prefect_redis.locking import RedisLockManager
 from redis.asyncio.sentinel import SentinelConnectionPool as AsyncSentinelPool
+from redis.credentials import CredentialProvider, UsernamePasswordCredentialProvider
 from redis.sentinel import SentinelConnectionPool as SyncSentinelPool
 
 SENTINEL_URL = "redis+sentinel://s1:26379,s2:26379/mymaster/1"
@@ -272,3 +275,58 @@ def test_block_as_connection_params_omits_connection_url_when_unset() -> None:
     params = RedisDatabase(host="cache").as_connection_params()
     assert "connection_url" not in params
     assert params["host"] == "cache"
+
+
+# ---------------------------------------------------------------------------
+# credential provider with URL and Sentinel URLs
+# ---------------------------------------------------------------------------
+
+
+def _make_url_test_provider() -> CredentialProvider:
+    return UsernamePasswordCredentialProvider("url_dyn_user", "url_dyn_pass")
+
+
+async def test_messaging_url_and_sentinel_forward_credential_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory_path = f"{__name__}:_make_url_test_provider"
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY", factory_path
+    )
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_URL",
+        "redis+sentinel://ignored:secret@s1:26379,s2:26379/mymaster/1"
+        "?sentinel_username=su&sentinel_password=sp",
+    )
+    client_module._client_cache.clear()
+    clear_cached_credential_providers()
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            client = get_async_redis_client()
+        assert any("credential_provider" in str(w.message) for w in caught)
+        assert isinstance(client.connection_pool, AsyncSentinelPool)
+        conn = client.connection_pool.connection_kwargs
+        assert isinstance(conn["credential_provider"], CredentialProvider)
+        assert conn.get("username") is None
+        assert conn.get("password") is None
+        for daemon in client.connection_pool.sentinel_manager.sentinels:
+            daemon_conn = daemon.connection_pool.connection_kwargs
+            assert (daemon_conn["username"], daemon_conn["password"]) == ("su", "sp")
+
+        standalone_settings = RedisMessagingSettings(
+            url="redis://ignored:secret@cache:6380/2",
+            credential_provider_factory=factory_path,
+        )
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            standalone = async_redis_from_settings(standalone_settings)
+        standalone_conn = standalone.connection_pool.connection_kwargs
+        assert standalone_conn["credential_provider"] is conn["credential_provider"]
+        assert standalone_conn.get("username") is None
+        assert standalone_conn.get("password") is None
+        await standalone.aclose()
+        await aclose_redis_client(client)
+    finally:
+        client_module._client_cache.clear()
+        clear_cached_credential_providers()

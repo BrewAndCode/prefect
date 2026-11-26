@@ -1,11 +1,15 @@
 import asyncio
 import functools
+import importlib
+import os
+import threading
 import warnings
 from typing import Any, Callable, Optional, Union
 from urllib.parse import urlparse, urlunparse
 
 from pydantic import Field, model_validator
 from redis.asyncio import Redis
+from redis.credentials import CredentialProvider
 from typing_extensions import Self, TypeAlias
 
 from prefect.settings.base import (
@@ -82,10 +86,20 @@ class RedisMessagingSettings(PrefectBaseSettings):
             "with older Redis servers and proxies."
         ),
     )
+    credential_provider_factory: Optional[str] = Field(
+        default=None,
+        description=(
+            "Import path to a zero-argument callable returning a "
+            "`redis.credentials.CredentialProvider` instance (e.g. "
+            "`package.module:create_provider`). When set, the provider takes "
+            "precedence over static username/password and URL credentials."
+        ),
+    )
 
     _DISCRETE_FIELDS: frozenset[str] = frozenset(
         {"host", "port", "db", "username", "password", "ssl"}
     )
+    _STATIC_CREDENTIAL_FIELDS: frozenset[str] = frozenset({"username", "password"})
 
     @model_validator(mode="after")
     def _warn_url_overrides_discrete_fields(self) -> Self:
@@ -97,6 +111,18 @@ class RedisMessagingSettings(PrefectBaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _warn_credential_provider_overrides_static_credentials(self) -> Self:
+        if self.credential_provider_factory is not None and self.url is None:
+            conflicting = self._STATIC_CREDENTIAL_FIELDS & self.model_fields_set
+            if conflicting:
+                warnings.warn(
+                    "Redis credential_provider_factory is set; the following "
+                    "static credential fields are ignored: "
+                    f"{', '.join(sorted(conflicting))}",
+                )
+        return self
+
 
 CacheKey: TypeAlias = tuple[
     Callable[..., Any],
@@ -106,6 +132,100 @@ CacheKey: TypeAlias = tuple[
 ]
 
 _client_cache: dict[CacheKey, Redis] = {}
+_credential_provider_cache: dict[tuple[str, int], CredentialProvider] = {}
+_credential_provider_lock = threading.Lock()
+
+
+def _load_credential_provider_factory(
+    factory_path: str,
+) -> Callable[[], CredentialProvider]:
+    """Import and validate a zero-argument `CredentialProvider` factory callable."""
+    stripped = factory_path.strip()
+    if not stripped:
+        raise ValueError(
+            "Invalid credential_provider_factory: path must be a non-empty string."
+        )
+
+    if ":" in stripped:
+        module_name, _, attr_path = stripped.partition(":")
+        if not module_name or not attr_path or ":" in attr_path:
+            raise ValueError(
+                f"Invalid credential_provider_factory path {factory_path!r}. "
+                "Expected 'package.module:callable'."
+            )
+    elif "." in stripped:
+        module_name, attr_path = stripped.rsplit(".", 1)
+        if not module_name or not attr_path:
+            raise ValueError(
+                f"Invalid credential_provider_factory path {factory_path!r}. "
+                "Expected 'package.module:callable'."
+            )
+    else:
+        raise ValueError(
+            f"Invalid credential_provider_factory path {factory_path!r}. "
+            "Expected 'package.module:callable'."
+        )
+
+    try:
+        obj: Any = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ImportError(
+            f"Failed to import credential_provider_factory module {module_name!r} "
+            f"from {factory_path!r}: {exc}"
+        ) from exc
+
+    for attr in attr_path.split("."):
+        if not attr:
+            raise ValueError(
+                f"Invalid credential_provider_factory path {factory_path!r}. "
+                "Expected 'package.module:callable'."
+            )
+        try:
+            obj = getattr(obj, attr)
+        except AttributeError as exc:
+            raise AttributeError(
+                f"Credential provider factory {factory_path!r} could not be "
+                f"resolved: {exc}"
+            ) from exc
+
+    if not callable(obj):
+        raise TypeError(
+            f"Credential provider factory {factory_path!r} must be callable, "
+            f"got {type(obj).__name__}."
+        )
+
+    return obj
+
+
+def _resolve_credential_provider(factory_path: str) -> CredentialProvider:
+    """Resolve and cache a `CredentialProvider` once per process (PID-scoped)."""
+    normalized_path = factory_path.strip()
+    if not normalized_path:
+        raise ValueError(
+            "Invalid credential_provider_factory: path must be a non-empty string."
+        )
+
+    cache_key = (normalized_path, os.getpid())
+    with _credential_provider_lock:
+        if cache_key in _credential_provider_cache:
+            return _credential_provider_cache[cache_key]
+
+        factory = _load_credential_provider_factory(normalized_path)
+        provider = factory()
+        if not isinstance(provider, CredentialProvider):
+            raise TypeError(
+                f"Credential provider factory {factory_path!r} must return a "
+                f"redis.credentials.CredentialProvider instance, "
+                f"got {type(provider).__name__}."
+            )
+        _credential_provider_cache[cache_key] = provider
+        return provider
+
+
+def clear_cached_credential_providers() -> None:
+    """Clear cached `CredentialProvider` instances."""
+    with _credential_provider_lock:
+        _credential_provider_cache.clear()
 
 
 def is_cluster_url(url: str) -> bool:
@@ -190,6 +310,63 @@ async def clear_cached_clients() -> None:
     _client_cache.clear()
 
 
+def _build_async_redis_client(
+    *,
+    url: Union[str, None],
+    host: str,
+    port: int,
+    db: int,
+    username: str,
+    password: str,
+    health_check_interval: int,
+    ssl: bool,
+    credential_provider: Union[CredentialProvider, None],
+    explicit_static_credentials: bool,
+    options: dict[str, Any],
+) -> Redis:
+    """Build an async `Redis` client from URL or discrete connection parameters."""
+    if credential_provider is not None:
+        if explicit_static_credentials:
+            warnings.warn(
+                "Redis credential_provider is set; explicit username and "
+                "password credentials are ignored."
+            )
+        options.pop("username", None)
+        options.pop("password", None)
+        options["credential_provider"] = credential_provider
+
+    if url:
+        if is_cluster_url(url):
+            _raise_cluster_not_supported()
+        return redis_from_url(
+            url,
+            asynchronous=True,
+            health_check_interval=health_check_interval,
+            **options,
+        )
+
+    if credential_provider is not None:
+        return Redis(
+            host=host,
+            port=port,
+            db=db,
+            health_check_interval=health_check_interval,
+            ssl=ssl,
+            **options,
+        )
+
+    return Redis(
+        host=host,
+        port=port,
+        db=db,
+        password=password,
+        username=username,
+        health_check_interval=health_check_interval,
+        ssl=ssl,
+        **options,
+    )
+
+
 @cached
 def get_async_redis_client(
     url: Union[str, None] = None,
@@ -204,6 +381,7 @@ def get_async_redis_client(
     socket_timeout: Union[float, None, Any] = _UNSET,
     socket_connect_timeout: Union[float, None, Any] = _UNSET,
     protocol: Union[int, None] = None,
+    credential_provider: Union[CredentialProvider, None] = None,
 ) -> Redis:
     """Retrieves an async Redis client.
 
@@ -214,6 +392,10 @@ def get_async_redis_client(
     failover automatically. URL query options override the settings-derived
     connection defaults. Redis Cluster URLs are detected but intentionally not
     enabled yet.
+
+    When `credential_provider` is provided (or configured via
+    `PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY`), it takes precedence
+    over static `username`/`password` and embedded URL credentials.
 
     Args:
         url: Full Redis URL (e.g. `redis://localhost:6379/0` or
@@ -230,11 +412,22 @@ def get_async_redis_client(
         socket_timeout: Timeout for socket read operations (None = no timeout).
         socket_connect_timeout: Timeout for socket connect (None = no timeout).
         protocol: RESP protocol version (default 2 from settings).
+        credential_provider: Optional `redis.credentials.CredentialProvider`
+            instance overriding `PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY`.
 
     Returns:
         Redis: a Redis client
     """
     settings = RedisMessagingSettings()
+
+    resolved_credential_provider = credential_provider
+    if (
+        resolved_credential_provider is None
+        and settings.credential_provider_factory is not None
+    ):
+        resolved_credential_provider = _resolve_credential_provider(
+            settings.credential_provider_factory
+        )
 
     resolved_socket_timeout = (
         settings.socket_timeout if socket_timeout is _UNSET else socket_timeout
@@ -246,40 +439,27 @@ def get_async_redis_client(
     )
     resolved_protocol = protocol if protocol is not None else settings.protocol
 
-    url = url or settings.url
-    if url:
-        if is_cluster_url(url):
-            _raise_cluster_not_supported()
-        return redis_from_url(
-            url,
-            asynchronous=True,
-            health_check_interval=(
-                health_check_interval
-                if health_check_interval is not None
-                else settings.health_check_interval
-            ),
-            decode_responses=decode_responses,
-            socket_timeout=resolved_socket_timeout,
-            socket_connect_timeout=resolved_socket_connect_timeout,
-            protocol=resolved_protocol,
-        )
-
-    return Redis(
+    return _build_async_redis_client(
+        url=url or settings.url,
         host=host or settings.host,
         port=port if port is not None else settings.port,
         db=db if db is not None else settings.db,
-        password=password or settings.password,
         username=username or settings.username,
+        password=password or settings.password,
         health_check_interval=(
             health_check_interval
             if health_check_interval is not None
             else settings.health_check_interval
         ),
         ssl=ssl if ssl is not None else settings.ssl,
-        decode_responses=decode_responses,
-        socket_timeout=resolved_socket_timeout,
-        socket_connect_timeout=resolved_socket_connect_timeout,
-        protocol=resolved_protocol,
+        credential_provider=resolved_credential_provider,
+        explicit_static_credentials=(username is not None or password is not None),
+        options={
+            "decode_responses": decode_responses,
+            "socket_timeout": resolved_socket_timeout,
+            "socket_connect_timeout": resolved_socket_connect_timeout,
+            "protocol": resolved_protocol,
+        },
     )
 
 
@@ -287,7 +467,8 @@ def get_async_redis_client(
 def async_redis_from_settings(
     settings: RedisMessagingSettings, **options: Any
 ) -> Redis:
-    options = {
+    """Create a cached async Redis client from a `RedisMessagingSettings` instance."""
+    resolved_options: dict[str, Any] = {
         "decode_responses": True,
         "socket_timeout": settings.socket_timeout,
         "socket_connect_timeout": settings.socket_connect_timeout,
@@ -295,23 +476,30 @@ def async_redis_from_settings(
         **options,
     }
 
-    if settings.url:
-        if is_cluster_url(settings.url):
-            _raise_cluster_not_supported()
-        return redis_from_url(
-            settings.url,
-            asynchronous=True,
-            health_check_interval=settings.health_check_interval,
-            **options,
+    explicit_static_credentials = (
+        resolved_options.get("username") is not None
+        or resolved_options.get("password") is not None
+    )
+
+    resolved_credential_provider = resolved_options.pop("credential_provider", None)
+    if (
+        resolved_credential_provider is None
+        and settings.credential_provider_factory is not None
+    ):
+        resolved_credential_provider = _resolve_credential_provider(
+            settings.credential_provider_factory
         )
 
-    return Redis(
+    return _build_async_redis_client(
+        url=settings.url,
         host=settings.host,
         port=settings.port,
         db=settings.db,
-        password=settings.password,
         username=settings.username,
+        password=settings.password,
         health_check_interval=settings.health_check_interval,
         ssl=settings.ssl,
-        **options,
+        credential_provider=resolved_credential_provider,
+        explicit_static_credentials=explicit_static_credentials,
+        options=resolved_options,
     )

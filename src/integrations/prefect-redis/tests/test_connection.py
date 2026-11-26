@@ -6,6 +6,7 @@ pool only. Building a client is lazy and opens no connection, so no Redis or
 Sentinel topology is required.
 """
 
+import warnings
 from unittest import mock
 
 import pytest
@@ -24,6 +25,7 @@ from redis.asyncio.sentinel import (
     SentinelManagedSSLConnection as AsyncSentinelManagedSSL,
 )
 from redis.connection import Connection, SSLConnection
+from redis.credentials import UsernamePasswordCredentialProvider
 from redis.sentinel import SentinelConnectionPool as SyncSentinelPool
 from redis.sentinel import SentinelManagedConnection, SentinelManagedSSLConnection
 
@@ -386,3 +388,142 @@ def test_close_redis_client_standalone() -> None:
 
 async def test_aclose_redis_client_standalone() -> None:
     await aclose_redis_client(redis_from_url("redis://cache:6379/0", asynchronous=True))
+
+
+# ---------------------------------------------------------------------------
+# credential_provider precedence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "rediss://u:topsecret@cache:6380/2?socket_timeout=2.5",
+        "redis://cache:6380/2?username=u&password=topsecret&socket_timeout=2.5",
+        "redis://u:topsecret@[::1]:6380/2?socket_timeout=2.5",
+    ],
+    ids=["userinfo", "query_params", "ipv6_userinfo"],
+)
+def test_standalone_url_strips_embedded_credentials_sync(url: str) -> None:
+    provider = UsernamePasswordCredentialProvider("dyn_user", "dyn_pass")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        client = redis_from_url(url, asynchronous=False, credential_provider=provider)
+    try:
+        assert any("credential_provider" in str(w.message) for w in caught)
+        assert all("topsecret" not in str(w.message) for w in caught)
+        conn = client.connection_pool.connection_kwargs
+        assert conn["credential_provider"] is provider
+        assert conn.get("username") is None
+        assert conn.get("password") is None
+        assert conn["socket_timeout"] == 2.5
+        client.connection_pool.make_connection()
+    finally:
+        close_redis_client(client)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "rediss://u:topsecret@cache:6380/2?socket_timeout=2.5",
+        "redis://cache:6380/2?username=u&password=topsecret&socket_timeout=2.5",
+        "redis://u:topsecret@[::1]:6380/2?socket_timeout=2.5",
+    ],
+    ids=["userinfo", "query_params", "ipv6_userinfo"],
+)
+async def test_standalone_url_strips_embedded_credentials_async(url: str) -> None:
+    provider = UsernamePasswordCredentialProvider("dyn_user", "dyn_pass")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        client = redis_from_url(url, asynchronous=True, credential_provider=provider)
+    try:
+        assert any("credential_provider" in str(w.message) for w in caught)
+        assert all("topsecret" not in str(w.message) for w in caught)
+        conn = client.connection_pool.connection_kwargs
+        assert conn["credential_provider"] is provider
+        assert conn.get("username") is None
+        assert conn.get("password") is None
+        assert conn["socket_timeout"] == 2.5
+        client.connection_pool.make_connection()
+    finally:
+        await aclose_redis_client(client)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "redis://:@localhost:6379/0",
+        "redis://localhost:6379/0?username=&password=",
+    ],
+    ids=["empty_userinfo", "empty_query_params"],
+)
+async def test_standalone_url_empty_credentials_emit_no_warning(url: str) -> None:
+    provider = UsernamePasswordCredentialProvider("dyn_user", "dyn_pass")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        client = redis_from_url(url, asynchronous=True, credential_provider=provider)
+    try:
+        assert len(caught) == 0
+        conn = client.connection_pool.connection_kwargs
+        assert conn["credential_provider"] is provider
+        assert conn.get("username") is None
+        assert conn.get("password") is None
+        client.connection_pool.make_connection()
+    finally:
+        await aclose_redis_client(client)
+
+
+def test_sentinel_url_strips_data_node_credentials_sync() -> None:
+    provider = UsernamePasswordCredentialProvider("dyn_user", "dyn_pass")
+    url = (
+        "redis+sentinel://app:topsecret@s1:26379,s2:26379/mymaster"
+        "?sentinel_username=su&sentinel_password=sp&socket_timeout=3"
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        client = redis_from_url(url, asynchronous=False, credential_provider=provider)
+    try:
+        assert any("credential_provider" in str(w.message) for w in caught)
+        assert all("topsecret" not in str(w.message) for w in caught)
+        conn = client.connection_pool.connection_kwargs
+        assert conn["credential_provider"] is provider
+        assert conn.get("username") is None
+        assert conn.get("password") is None
+        assert conn["socket_timeout"] == 3.0
+        for daemon in daemons(client):
+            daemon_conn = daemon.connection_pool.connection_kwargs
+            assert (daemon_conn["username"], daemon_conn["password"]) == ("su", "sp")
+            assert daemon_conn.get("credential_provider") is None
+        client.connection_pool.make_connection()
+    finally:
+        close_redis_client(client)
+
+
+async def test_sentinel_url_strips_data_node_credentials_async() -> None:
+    provider = UsernamePasswordCredentialProvider("dyn_user", "dyn_pass")
+    url = (
+        "rediss+sentinel://app:topsecret@s1:26379,s2:26379/mymaster"
+        "?ssl_ca_certs=/etc/ca.pem&sentinel_username=su&sentinel_password=sp"
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        client = redis_from_url(url, asynchronous=True, credential_provider=provider)
+    try:
+        assert any("credential_provider" in str(w.message) for w in caught)
+        assert all("topsecret" not in str(w.message) for w in caught)
+        pool = client.connection_pool
+        assert pool.connection_class is AsyncSentinelManagedSSL
+        conn = pool.connection_kwargs
+        assert conn["credential_provider"] is provider
+        assert conn["ssl_ca_certs"] == "/etc/ca.pem"
+        assert conn.get("username") is None
+        assert conn.get("password") is None
+        for daemon in daemons(client):
+            daemon_conn = daemon.connection_pool.connection_kwargs
+            assert daemon.connection_pool.connection_class is AsyncSSLConnection
+            assert daemon_conn["ssl_ca_certs"] == "/etc/ca.pem"
+            assert (daemon_conn["username"], daemon_conn["password"]) == ("su", "sp")
+            assert daemon_conn.get("credential_provider") is None
+        pool.make_connection()
+    finally:
+        await aclose_redis_client(client)

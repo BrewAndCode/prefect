@@ -1,5 +1,9 @@
 import asyncio
+import os
+import sys
+import uuid
 import warnings
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,6 +13,7 @@ from prefect_redis.client import (
     _client_cache,
     async_redis_from_settings,
     clear_cached_clients,
+    clear_cached_credential_providers,
     close_all_cached_connections,
     cluster_key_prefix,
     get_async_redis_client,
@@ -18,6 +23,7 @@ from prefect_redis.client import (
 )
 from redis.asyncio import Redis
 from redis.cluster import key_slot
+from redis.credentials import CredentialProvider, UsernamePasswordCredentialProvider
 
 
 def test_redis_settings_defaults(isolated_redis_db_number: int):
@@ -511,3 +517,458 @@ def test_close_all_cached_connections_closes_sentinel_daemons():
     finally:
         _client_cache.clear()
         loop.close()
+
+
+class _RecordingCredentialProvider(CredentialProvider):
+    def __init__(self, username: str, password: str) -> None:
+        self.username = username
+        self.password = password
+        self.calls = 0
+
+    def get_credentials(self) -> tuple[str, str]:
+        self.calls += 1
+        return self.username, self.password
+
+    async def get_credentials_async(self) -> tuple[str, str]:
+        self.calls += 1
+        return self.username, self.password
+
+
+class _FactoryHolder:
+    @classmethod
+    def create_classmethod(cls) -> CredentialProvider:
+        return UsernamePasswordCredentialProvider("holder_user", "holder_pass")
+
+
+_LIVE_PROVIDERS: list[CredentialProvider] = []
+_LIVE_FACTORY_CALLS = 0
+
+
+def _create_live_provider() -> CredentialProvider:
+    global _LIVE_FACTORY_CALLS
+    _LIVE_FACTORY_CALLS += 1
+    return _LIVE_PROVIDERS[0]
+
+
+def _create_provider_for_dotted_import() -> CredentialProvider:
+    return UsernamePasswordCredentialProvider("dotted_user", "dotted_pass")
+
+
+_NON_CALLABLE_TARGET = "not-callable"
+
+
+def _raising_factory() -> CredentialProvider:
+    raise RuntimeError("factory boom")
+
+
+def _invalid_return_factory() -> object:
+    return "not-a-credential-provider"
+
+
+def test_credential_provider_factory_setting_default_and_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    assert RedisMessagingSettings().credential_provider_factory is None
+
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        "pkg.module:create_provider",
+    )
+    settings = RedisMessagingSettings()
+    assert settings.credential_provider_factory == "pkg.module:create_provider"
+
+
+def test_credential_provider_factory_with_url_emits_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("PREFECT_REDIS_MESSAGING_DB", raising=False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        settings = RedisMessagingSettings(
+            url="redis://myhost:6380/2",
+            credential_provider_factory="pkg.module:create_provider",
+        )
+    assert settings.url == "redis://myhost:6380/2"
+    assert settings.credential_provider_factory == "pkg.module:create_provider"
+    assert len(caught) == 0
+
+
+def test_credential_provider_factory_warns_when_static_credentials_set(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("PREFECT_REDIS_MESSAGING_USERNAME", "static_user")
+    monkeypatch.setenv("PREFECT_REDIS_MESSAGING_PASSWORD", "static_pass")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        RedisMessagingSettings(
+            credential_provider_factory="pkg.module:create_provider",
+        )
+    assert len(caught) == 1
+    message = str(caught[0].message)
+    assert "credential_provider_factory" in message
+    assert "username" in message
+    assert "password" in message
+
+
+def test_credential_provider_factory_is_lazily_imported(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        "nonexistent_module_12345:create_provider",
+    )
+    # Constructing settings must not import the factory.
+    settings = RedisMessagingSettings()
+    assert (
+        settings.credential_provider_factory
+        == "nonexistent_module_12345:create_provider"
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory_path", "exc_type", "match"),
+    [
+        ("", ValueError, "non-empty"),
+        ("   ", ValueError, "non-empty"),
+        ("no_separator", ValueError, "Invalid credential_provider_factory"),
+        (":missing_module", ValueError, "Invalid credential_provider_factory"),
+        ("missing_attr:", ValueError, "Invalid credential_provider_factory"),
+        ("mod:attr:extra", ValueError, "Invalid credential_provider_factory"),
+        ("nonexistent_pkg_xyz.mod:create", ImportError, "Failed to import"),
+        (
+            "prefect_redis.client:missing_factory_attr",
+            AttributeError,
+            "could not be resolved",
+        ),
+        (f"{__name__}:_NON_CALLABLE_TARGET", TypeError, "must be callable"),
+        (f"{__name__}:_raising_factory", RuntimeError, "factory boom"),
+        (
+            f"{__name__}:_invalid_return_factory",
+            TypeError,
+            "CredentialProvider instance",
+        ),
+    ],
+)
+def test_invalid_credential_provider_factory_fails_clearly(
+    monkeypatch: pytest.MonkeyPatch,
+    factory_path: str,
+    exc_type: type[Exception],
+    match: str,
+):
+    _client_cache.clear()
+    clear_cached_credential_providers()
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY", factory_path
+    )
+    try:
+        with pytest.raises(exc_type, match=match):
+            get_async_redis_client()
+    finally:
+        _client_cache.clear()
+        clear_cached_credential_providers()
+
+
+@pytest.mark.parametrize(
+    "factory_path",
+    [
+        f"{__name__}:_create_provider_for_dotted_import",
+        f"{__name__}._create_provider_for_dotted_import",
+        f"{__name__}:_FactoryHolder.create_classmethod",
+    ],
+)
+async def test_credential_provider_factory_supported_import_formats(
+    monkeypatch: pytest.MonkeyPatch,
+    factory_path: str,
+):
+    _client_cache.clear()
+    clear_cached_credential_providers()
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY", factory_path
+    )
+    try:
+        client = get_async_redis_client()
+        conn_kwargs = client.connection_pool.connection_kwargs
+        assert isinstance(conn_kwargs["credential_provider"], CredentialProvider)
+        assert conn_kwargs.get("username") is None
+        assert conn_kwargs.get("password") is None
+        await client.aclose()
+    finally:
+        _client_cache.clear()
+        clear_cached_credential_providers()
+
+
+async def test_credential_provider_cached_once_per_process_across_client_clears(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    module_name = f"_test_provider_mod_{uuid.uuid4().hex}"
+    module_file = tmp_path / f"{module_name}.py"
+    module_file.write_text(
+        "from redis.credentials import UsernamePasswordCredentialProvider\n"
+        "CALLS = 0\n"
+        "def create_provider():\n"
+        "    global CALLS\n"
+        "    CALLS += 1\n"
+        "    return UsernamePasswordCredentialProvider('u', f'p-{CALLS}')\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _client_cache.clear()
+    clear_cached_credential_providers()
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        f"{module_name}:create_provider",
+    )
+
+    try:
+        client1 = get_async_redis_client()
+        client2 = async_redis_from_settings(RedisMessagingSettings())
+        provider1 = client1.connection_pool.connection_kwargs["credential_provider"]
+        provider2 = client2.connection_pool.connection_kwargs["credential_provider"]
+        assert provider1 is provider2
+
+        # Whitespace around factory path must hit the exact same cache entry.
+        monkeypatch.setenv(
+            "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+            f" {module_name}:create_provider ",
+        )
+        await clear_cached_clients()
+        client_ws = get_async_redis_client()
+        assert (
+            client_ws.connection_pool.connection_kwargs["credential_provider"]
+            is provider1
+        )
+        assert sys.modules[module_name].CALLS == 1
+
+        # Clearing client cache on reconnect must preserve the process-level provider.
+        monkeypatch.setenv(
+            "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+            f"{module_name}:create_provider",
+        )
+        await clear_cached_clients()
+        client3 = get_async_redis_client()
+        provider3 = client3.connection_pool.connection_kwargs["credential_provider"]
+        assert provider3 is provider1
+        assert sys.modules[module_name].CALLS == 1
+
+        # Forking / a new PID gets its own provider instance rather than sharing parent's.
+        monkeypatch.setattr(os, "getpid", lambda: 999999)
+        await clear_cached_clients()
+        client4 = get_async_redis_client()
+        provider4 = client4.connection_pool.connection_kwargs["credential_provider"]
+        assert provider4 is not provider1
+        assert sys.modules[module_name].CALLS == 2
+
+        await client1.aclose()
+        await client2.aclose()
+        await client_ws.aclose()
+        await client3.aclose()
+        await client4.aclose()
+    finally:
+        _client_cache.clear()
+        clear_cached_credential_providers()
+        sys.modules.pop(module_name, None)
+
+
+async def test_static_credentials_ignored_with_warning_when_provider_active(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _client_cache.clear()
+    clear_cached_credential_providers()
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        f"{__name__}:_create_provider_for_dotted_import",
+    )
+
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            client = get_async_redis_client(username="explicit_user", password="secret")
+
+        assert any(
+            "credential_provider" in str(w.message) and "ignored" in str(w.message)
+            for w in caught
+        )
+        conn_kwargs = client.connection_pool.connection_kwargs
+        assert isinstance(conn_kwargs["credential_provider"], CredentialProvider)
+        assert conn_kwargs.get("username") is None
+        assert conn_kwargs.get("password") is None
+
+        settings = RedisMessagingSettings()
+        with warnings.catch_warnings(record=True) as caught_settings:
+            warnings.simplefilter("always")
+            client_from_settings = async_redis_from_settings(
+                settings, username="opt_user", password="secret"
+            )
+        assert any("credential_provider" in str(w.message) for w in caught_settings)
+        settings_conn = client_from_settings.connection_pool.connection_kwargs
+        assert (
+            settings_conn["credential_provider"] is conn_kwargs["credential_provider"]
+        )
+        assert settings_conn.get("username") is None
+        assert settings_conn.get("password") is None
+
+        await client.aclose()
+        await client_from_settings.aclose()
+    finally:
+        _client_cache.clear()
+        clear_cached_credential_providers()
+
+
+async def test_explicit_credential_provider_overrides_factory_setting(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _client_cache.clear()
+    clear_cached_credential_providers()
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        f"{__name__}:_create_provider_for_dotted_import",
+    )
+    explicit_provider = UsernamePasswordCredentialProvider("explicit", "token")
+    try:
+        client = get_async_redis_client(credential_provider=explicit_provider)
+        assert (
+            client.connection_pool.connection_kwargs["credential_provider"]
+            is explicit_provider
+        )
+        await client.aclose()
+    finally:
+        _client_cache.clear()
+        clear_cached_credential_providers()
+
+
+async def test_async_redis_from_settings_explicit_none_provider_behavior():
+    _client_cache.clear()
+    clear_cached_credential_providers()
+    try:
+        with_factory = RedisMessagingSettings(
+            credential_provider_factory=f"{__name__}:_create_provider_for_dotted_import"
+        )
+        client = async_redis_from_settings(with_factory, credential_provider=None)
+        conn_kwargs = client.connection_pool.connection_kwargs
+        assert isinstance(conn_kwargs["credential_provider"], CredentialProvider)
+        assert conn_kwargs.get("username") is None
+        assert conn_kwargs.get("password") is None
+        await client.aclose()
+
+        without_factory = RedisMessagingSettings()
+        with patch("prefect_redis.client.Redis", wraps=Redis) as wrapped_redis:
+            plain_client = async_redis_from_settings(
+                without_factory, credential_provider=None
+            )
+        assert "credential_provider" not in wrapped_redis.call_args.kwargs
+        plain_kwargs = plain_client.connection_pool.connection_kwargs
+        assert plain_kwargs.get("credential_provider") is None
+        assert plain_kwargs["username"] == "default"
+        await plain_client.aclose()
+    finally:
+        _client_cache.clear()
+        clear_cached_credential_providers()
+
+
+async def test_unset_credential_provider_preserves_static_credentials():
+    _client_cache.clear()
+    clear_cached_credential_providers()
+    try:
+        client = get_async_redis_client(username="user_a", password="pass_a")
+        conn_kwargs = client.connection_pool.connection_kwargs
+        assert conn_kwargs["username"] == "user_a"
+        assert conn_kwargs["password"] == "pass_a"
+        assert conn_kwargs.get("credential_provider") is None
+        await client.aclose()
+    finally:
+        _client_cache.clear()
+
+
+async def test_credential_provider_authenticates_and_rotates_on_live_redis(
+    redis: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    global _LIVE_FACTORY_CALLS
+    acl_user = f"prefect_test_{uuid.uuid4().hex[:12]}"
+    pass1 = f"pass1_{uuid.uuid4().hex[:8]}"
+    pass2 = f"pass2_{uuid.uuid4().hex[:8]}"
+    provider = _RecordingCredentialProvider(acl_user, pass1)
+
+    await redis.execute_command(
+        "ACL", "SETUSER", acl_user, "on", f">{pass1}", "~*", "+@all"
+    )
+    await clear_cached_clients()
+    clear_cached_credential_providers()
+    _LIVE_PROVIDERS[:] = [provider]
+    _LIVE_FACTORY_CALLS = 0
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        f"{__name__}:_create_live_provider",
+    )
+
+    clients: list[Redis] = []
+    try:
+        client1 = get_async_redis_client()
+        clients.append(client1)
+        assert await client1.ping() is True
+        assert _LIVE_FACTORY_CALLS == 1
+        assert provider.calls >= 1
+
+        # Rotate credentials in Redis and on the provider, then force new client
+        # after clear_cached_clients(); provider must stay cached and supply pass2.
+        await redis.execute_command(
+            "ACL", "SETUSER", acl_user, "resetpass", f">{pass2}"
+        )
+        provider.password = pass2
+        await clear_cached_clients()
+
+        client2 = get_async_redis_client()
+        clients.append(client2)
+        assert await client2.ping() is True
+        assert _LIVE_FACTORY_CALLS == 1
+        assert provider.calls >= 2
+    finally:
+        for client in clients:
+            await client.aclose()
+        await clear_cached_clients()
+        clear_cached_credential_providers()
+        _LIVE_PROVIDERS.clear()
+        _LIVE_FACTORY_CALLS = 0
+        await redis.execute_command("ACL", "DELUSER", acl_user)
+
+
+async def test_credential_provider_url_with_bad_credentials_authenticates_on_live_redis(
+    redis: Redis,
+    isolated_redis_db_number: int,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    acl_user = f"prefect_url_{uuid.uuid4().hex[:12]}"
+    acl_pass = f"url_pass_{uuid.uuid4().hex[:8]}"
+    provider = _RecordingCredentialProvider(acl_user, acl_pass)
+
+    await redis.execute_command(
+        "ACL", "SETUSER", acl_user, "on", f">{acl_pass}", "~*", "+@all"
+    )
+    await clear_cached_clients()
+    clear_cached_credential_providers()
+    _LIVE_PROVIDERS[:] = [provider]
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        f"{__name__}:_create_live_provider",
+    )
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_URL",
+        f"redis://wrong_user:wrong_secret@localhost:6379/{isolated_redis_db_number}",
+    )
+
+    client: Redis | None = None
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            client = get_async_redis_client()
+        assert any("credential_provider" in str(w.message) for w in caught)
+        assert all("wrong_secret" not in str(w.message) for w in caught)
+        assert await client.ping() is True
+        assert provider.calls >= 1
+    finally:
+        if client is not None:
+            await client.aclose()
+        await clear_cached_clients()
+        clear_cached_credential_providers()
+        _LIVE_PROVIDERS.clear()
+        await redis.execute_command("ACL", "DELUSER", acl_user)

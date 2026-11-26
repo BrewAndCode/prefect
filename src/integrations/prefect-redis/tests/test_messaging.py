@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 import anyio
 import pytest
-from prefect_redis.client import _client_cache, clear_cached_clients
+from prefect_redis.client import (
+    _client_cache,
+    clear_cached_clients,
+    clear_cached_credential_providers,
+)
+from prefect_redis.connection import aclose_redis_client
 from prefect_redis.messaging import (
     Cache,
     Consumer,
@@ -28,6 +33,7 @@ from prefect_redis.messaging import (
 )
 from redis.asyncio import Redis, RedisCluster
 from redis.cluster import key_slot
+from redis.credentials import CredentialProvider, UsernamePasswordCredentialProvider
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from prefect.server.events import Event
@@ -1327,3 +1333,148 @@ async def test_orphan_entries_acked_when_auto_ack_disabled(
     assert orphan_id in acked_ids, (
         "Orphan entry should be acked even with automatically_acknowledge=False"
     )
+
+
+_ACL_MESSAGING_PROVIDERS: list[CredentialProvider] = []
+
+
+def _get_messaging_acl_provider() -> CredentialProvider:
+    return _ACL_MESSAGING_PROVIDERS[0]
+
+
+class _RotatingMessagingProvider(CredentialProvider):
+    def __init__(self, username: str, password: str) -> None:
+        self.username = username
+        self.password = password
+
+    def get_credentials(self) -> tuple[str, str]:
+        return self.username, self.password
+
+    async def get_credentials_async(self) -> tuple[str, str]:
+        return self.username, self.password
+
+
+async def _close_cached_clients() -> None:
+    seen: set[int] = set()
+    for client in list(_client_cache.values()):
+        if id(client) not in seen:
+            seen.add(id(client))
+            await aclose_redis_client(client)
+    await clear_cached_clients()
+
+
+async def test_messaging_uses_credential_provider_factory(
+    redis: Redis,
+    broker: str,
+    configured_cache: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify Cache, Publisher, and Consumer authenticate via CredentialProvider."""
+    acl_user = f"prefect_msg_{uuid.uuid4().hex[:12]}"
+    acl_pass = f"msg_pass_{uuid.uuid4().hex[:8]}"
+    provider = UsernamePasswordCredentialProvider(acl_user, acl_pass)
+
+    await redis.execute_command(
+        "ACL", "SETUSER", acl_user, "on", f">{acl_pass}", "~*", "+@all"
+    )
+    await clear_cached_clients()
+    clear_cached_credential_providers()
+    _ACL_MESSAGING_PROVIDERS[:] = [provider]
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        f"{__name__}:_get_messaging_acl_provider",
+    )
+
+    topic = f"cred-provider-topic-{uuid.uuid4().hex[:8]}"
+    captured: list[Message] = []
+
+    async def handler(message: Message):
+        captured.append(message)
+        raise StopConsumer(ack=True)
+
+    try:
+        cache_instance = create_cache()
+        assert (
+            cache_instance._client.connection_pool.connection_kwargs[
+                "credential_provider"
+            ]
+            is provider
+        )
+
+        async with create_publisher(topic, cache=cache_instance) as pub:
+            await pub.publish_data(b"hello-cred-provider", {"id": "1"})
+
+        consumer = create_consumer(topic)
+        with anyio.move_on_after(5.0):
+            await consumer.run(handler)
+
+        assert len(captured) == 1
+        assert captured[0].data == "hello-cred-provider"
+    finally:
+        await _close_cached_clients()
+        clear_cached_credential_providers()
+        _ACL_MESSAGING_PROVIDERS.clear()
+        await redis.execute_command("ACL", "DELUSER", acl_user)
+
+
+async def test_consumer_reconnects_with_rotated_credential_provider(
+    redis: Redis,
+    broker: str,
+    configured_cache: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Consumer reconnect clears cached clients, preserves provider, and uses new credentials."""
+    acl_user = f"prefect_reconn_{uuid.uuid4().hex[:10]}"
+    pass1 = f"pass1_{uuid.uuid4().hex[:8]}"
+    pass2 = f"pass2_{uuid.uuid4().hex[:8]}"
+    provider = _RotatingMessagingProvider(acl_user, pass1)
+
+    await redis.execute_command(
+        "ACL", "SETUSER", acl_user, "on", f">{pass1}", "~*", "+@all"
+    )
+    await clear_cached_clients()
+    clear_cached_credential_providers()
+    _ACL_MESSAGING_PROVIDERS[:] = [provider]
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        f"{__name__}:_get_messaging_acl_provider",
+    )
+
+    topic = f"cred-reconnect-topic-{uuid.uuid4().hex[:8]}"
+    captured: list[Message] = []
+    connection_error_count = 0
+    original_xreadgroup = Redis.xreadgroup
+
+    async def handler(message: Message):
+        captured.append(message)
+        raise StopConsumer(ack=True)
+
+    async def failing_then_rotated_xreadgroup(self, *args, **kwargs):
+        nonlocal connection_error_count
+        if connection_error_count == 0:
+            connection_error_count += 1
+            await redis.execute_command(
+                "ACL", "SETUSER", acl_user, "resetpass", f">{pass2}"
+            )
+            provider.password = pass2
+            raise RedisConnectionError("Simulated connection drop")
+        return await original_xreadgroup(self, *args, **kwargs)
+
+    try:
+        consumer = create_consumer(topic, block=timedelta(milliseconds=100))
+        with patch.object(Redis, "xreadgroup", failing_then_rotated_xreadgroup):
+            consumer_task = asyncio.create_task(consumer.run(handler))
+            await asyncio.sleep(0.3)
+            async with create_publisher(topic) as pub:
+                await pub.publish_data(b"after-rotation", {"id": "1"})
+            with anyio.move_on_after(5.0):
+                await consumer_task
+
+        assert connection_error_count == 1
+        assert len(captured) == 1
+        assert captured[0].data == "after-rotation"
+    finally:
+        await _close_cached_clients()
+        clear_cached_credential_providers()
+        _ACL_MESSAGING_PROVIDERS.clear()
+        await redis.execute_command("ACL", "DELUSER", acl_user)

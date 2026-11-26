@@ -4,13 +4,16 @@ from typing import Sequence
 from uuid import uuid4
 
 import pytest
+from prefect_redis.client import clear_cached_clients, clear_cached_credential_providers
+from prefect_redis.connection import aclose_redis_client
 from prefect_redis.ordering import (
     MAX_DEPTH_OF_PRECEDING_EVENT,
     CausalOrdering,
     EventArrivedEarly,
 )
-from redis.asyncio import RedisCluster
+from redis.asyncio import Redis, RedisCluster
 from redis.cluster import key_slot
+from redis.credentials import CredentialProvider, UsernamePasswordCredentialProvider
 
 from prefect.server.events.schemas.events import ReceivedEvent, Resource
 from prefect.types import DateTime
@@ -495,3 +498,49 @@ async def test_followers_processed_by_leader_are_marked_as_seen(
     assert await causal_ordering.event_has_been_seen(event_two) is True
     # event_one is also seen (set by the Lua script in event_is_processing)
     assert await causal_ordering.event_has_been_seen(event_one) is True
+
+
+_ACL_ORDERING_PROVIDERS: list[CredentialProvider] = []
+
+
+def _get_ordering_acl_provider() -> CredentialProvider:
+    return _ACL_ORDERING_PROVIDERS[0]
+
+
+async def test_causal_ordering_uses_credential_provider_factory(
+    redis: Redis,
+    event_one: ReceivedEvent,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify CausalOrdering authenticates and runs via CredentialProvider."""
+    acl_user = f"prefect_ord_{uuid4().hex[:12]}"
+    acl_pass = f"ord_pass_{uuid4().hex[:8]}"
+    provider = UsernamePasswordCredentialProvider(acl_user, acl_pass)
+
+    await redis.execute_command(
+        "ACL", "SETUSER", acl_user, "on", f">{acl_pass}", "~*", "+@all"
+    )
+    await clear_cached_clients()
+    clear_cached_credential_providers()
+    _ACL_ORDERING_PROVIDERS[:] = [provider]
+    monkeypatch.setenv(
+        "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+        f"{__name__}:_get_ordering_acl_provider",
+    )
+
+    ordering: CausalOrdering | None = None
+    try:
+        ordering = CausalOrdering(scope=f"cred-test-{uuid4().hex[:8]}")
+        assert (
+            ordering.redis.connection_pool.connection_kwargs["credential_provider"]
+            is provider
+        )
+        await ordering.record_event_as_seen(event_one)
+        assert await ordering.event_has_been_seen(event_one) is True
+    finally:
+        if ordering is not None:
+            await aclose_redis_client(ordering.redis)
+        await clear_cached_clients()
+        clear_cached_credential_providers()
+        _ACL_ORDERING_PROVIDERS.clear()
+        await redis.execute_command("ACL", "DELUSER", acl_user)

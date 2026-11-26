@@ -19,8 +19,9 @@ docket accepts for `PREFECT_SERVER_DOCKET_URL`, so a single URL serves both.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Literal, overload
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import redis
 import redis.asyncio
@@ -42,6 +43,43 @@ def is_sentinel_url(url: str) -> bool:
     URL. Schemes are matched case-insensitively per RFC 3986.
     """
     return url.partition("://")[0].lower() in SENTINEL_SCHEMES
+
+
+def _strip_standalone_url_credentials(url: str) -> tuple[str, bool]:
+    """Remove embedded `username`/`password` from a standalone Redis URL.
+
+    Returns the sanitized URL and a boolean indicating whether any credentials
+    were removed.
+    """
+    parts = urlsplit(url)
+    removed = False
+
+    netloc = parts.netloc
+    if parts.username or parts.password:
+        _, _, hostpart = netloc.rpartition("@")
+        netloc = hostpart
+        removed = True
+
+    query_str = parts.query
+    if parts.query:
+        query = parse_qs(parts.query, keep_blank_values=True)
+        query_removed = False
+        for key in ("username", "password"):
+            values = query.get(key)
+            if values and any(values):
+                query.pop(key)
+                query_removed = True
+        if query_removed:
+            query_str = urlencode(query, doseq=True)
+            removed = True
+
+    if not removed:
+        return url, False
+
+    return (
+        urlunsplit((parts.scheme, netloc, parts.path, query_str, parts.fragment)),
+        True,
+    )
 
 
 @overload
@@ -74,12 +112,35 @@ def redis_from_url(
         ValueError: If the URL is malformed. Messages do not echo the URL, so
             credentials embedded in it are never leaked.
     """
+    has_credential_provider = kwargs.get("credential_provider") is not None
+
     if not is_sentinel_url(url):
+        if has_credential_provider:
+            url, stripped = _strip_standalone_url_credentials(url)
+            if stripped:
+                warnings.warn(
+                    "Redis credential_provider is set; credentials embedded in "
+                    "the Redis URL are ignored."
+                )
+            if kwargs.get("username") is not None or kwargs.get("password") is not None:
+                kwargs.pop("username", None)
+                kwargs.pop("password", None)
         redis_class = redis.asyncio.Redis if asynchronous else redis.Redis
         return redis_class.from_url(url, **kwargs)
 
     sentinels, service_name, sentinel_kwargs, url_options = _parse_sentinel_url(url)
     connection_kwargs = {**kwargs, **url_options}
+    if has_credential_provider:
+        url_had_credentials = bool(
+            url_options.get("username") or url_options.get("password")
+        )
+        if url_had_credentials:
+            warnings.warn(
+                "Redis credential_provider is set; credentials embedded in "
+                "the Redis URL are ignored."
+            )
+        connection_kwargs.pop("username", None)
+        connection_kwargs.pop("password", None)
     # redis-py copies the socket_* options to the daemon connections only when
     # sentinel_kwargs is None; the explicit dict carrying the daemons' auth/TLS
     # would suppress that, so apply the same fallback here. On a TLS scheme the

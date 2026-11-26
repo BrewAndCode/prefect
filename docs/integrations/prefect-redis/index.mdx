@@ -79,6 +79,22 @@ export PREFECT_REDIS_WORKER_CLEANUP_QUEUE_URL="redis+sentinel://sentinel-a:26379
 
 Both settings also accept single-node `redis://` / `rediss://` URLs.
 
+### Dynamic credentials with `CredentialProvider`
+
+For deployments using short-lived credentials (such as Vault, cloud IAM, or custom token rotation), configure `PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY` with the import path to a zero-argument callable that returns a `redis.credentials.CredentialProvider`:
+
+```bash
+export PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY="my_package.redis_auth:create_provider"
+```
+
+Prefect imports and invokes the factory lazily on first Redis messaging client creation, caches the provider once per process, and passes it to the async Redis clients used by Redis messaging, causal ordering, and concurrency lease storage.
+
+When `PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY` is set, the provider takes precedence over static `PREFECT_REDIS_MESSAGING_USERNAME` / `PREFECT_REDIS_MESSAGING_PASSWORD` values and any data-node credentials embedded in `PREFECT_REDIS_MESSAGING_URL` (Sentinel daemon credentials via `sentinel_username` / `sentinel_password` remain separate).
+
+<Note>
+  `PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY` applies only to clients configured through `RedisMessagingSettings` (Redis messaging, causal ordering, and concurrency lease storage). `WorkerCleanupQueue` (`PREFECT_REDIS_WORKER_CLEANUP_QUEUE_*`), `RedisDatabase`, and `RedisLockManager` have separate connection configurations and are not covered by this setting. Additionally, with `redis+sentinel://` / `rediss+sentinel://` URLs in `redis-py` 8.x, pull-based `CredentialProvider` implementations are consulted on data-node connect and reconnect, while `StreamingCredentialProvider` background push re-authentication callbacks are not attached automatically because `Sentinel.master_for` constructs clients via `Redis.from_pool`.
+</Note>
+
 ### Lock manager
 
 {/* pmd-metadata: notest */}

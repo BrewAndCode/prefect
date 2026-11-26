@@ -4,13 +4,22 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
+from prefect_redis.client import clear_cached_clients, clear_cached_credential_providers
+from prefect_redis.connection import aclose_redis_client
 from prefect_redis.lease_storage import ConcurrencyLeaseStorage
 from redis.asyncio import Redis, RedisCluster
 from redis.cluster import key_slot
+from redis.credentials import CredentialProvider, UsernamePasswordCredentialProvider
 
 from prefect.server.concurrency.lease_storage import ConcurrencyLimitLeaseMetadata
 from prefect.server.utilities.leasing import ResourceLease
 from prefect.types._concurrency import ConcurrencyLeaseHolder
+
+_ACL_LEASE_PROVIDERS: list[CredentialProvider] = []
+
+
+def _get_lease_acl_provider() -> CredentialProvider:
+    return _ACL_LEASE_PROVIDERS[0]
 
 
 class TestConcurrencyLeaseStorage:
@@ -613,3 +622,46 @@ class TestConcurrencyLeaseStorage:
         # Clean up
         for lease_id in lease_ids:
             await storage.revoke_lease(lease_id)
+
+    async def test_lease_storage_uses_credential_provider_factory(
+        self,
+        redis: Redis,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Verify ConcurrencyLeaseStorage authenticates and runs via CredentialProvider."""
+        acl_user = f"prefect_lease_{uuid4().hex[:12]}"
+        acl_pass = f"lease_pass_{uuid4().hex[:8]}"
+        provider = UsernamePasswordCredentialProvider(acl_user, acl_pass)
+
+        await redis.execute_command(
+            "ACL", "SETUSER", acl_user, "on", f">{acl_pass}", "~*", "+@all"
+        )
+        await clear_cached_clients()
+        clear_cached_credential_providers()
+        _ACL_LEASE_PROVIDERS[:] = [provider]
+        monkeypatch.setenv(
+            "PREFECT_REDIS_MESSAGING_CREDENTIAL_PROVIDER_FACTORY",
+            f"{__name__}:_get_lease_acl_provider",
+        )
+
+        storage: ConcurrencyLeaseStorage | None = None
+        try:
+            storage = ConcurrencyLeaseStorage()
+            assert (
+                storage.redis_client.connection_pool.connection_kwargs[
+                    "credential_provider"
+                ]
+                is provider
+            )
+            lease = await storage.create_lease([uuid4()], timedelta(minutes=5))
+            fetched = await storage.read_lease(lease.id)
+            assert fetched is not None
+            assert fetched.id == lease.id
+            await storage.revoke_lease(lease.id)
+        finally:
+            if storage is not None:
+                await aclose_redis_client(storage.redis_client)
+            await clear_cached_clients()
+            clear_cached_credential_providers()
+            _ACL_LEASE_PROVIDERS.clear()
+            await redis.execute_command("ACL", "DELUSER", acl_user)
